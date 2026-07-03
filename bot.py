@@ -1,11 +1,10 @@
 # ============================================================
 # WIXY – Playful, Autonomous Digital Companion
 # ============================================================
-# Based on AIX, but with a fun, female persona (Wixy) who
-# starts conversations by herself.
-# - All system prompts updated to Wixy's voice.
-# - Added ChattyAgent for autonomous, non-news messages.
-# - Keeps all memory, commands, news, and strategist features.
+# Same engine as AIX, different persona. Designed to run in the
+# SAME Discord server as AIX safely — see the on_message fix
+# below, which is what stops the two bots from talking to each
+# other in an infinite loop.
 # ============================================================
 
 import asyncio
@@ -42,24 +41,40 @@ load_dotenv()
 
 class Config:
     def __init__(self):
+        # --- These come from .env (secrets / per-deployment IDs) ---
         self.discord_token = os.getenv("DISCORD_TOKEN")
         self.groq_api_key = os.getenv("GROQ_API_KEY")
         self.database_url = os.getenv("DATABASE_URL")
         self.channel_id = self._int_or_none(os.getenv("CHANNEL_ID"))
         self.owner_id = self._int_or_none(os.getenv("OWNER_ID"))
+        # The creator recognition phrase. Kept in .env, not hardcoded — same
+        # reasoning as the API keys above. See detect_creator_code()'s
+        # docstring for the security model.
+        self.creator_code = os.getenv("CREATOR_CODE", "XTNT")
 
-        self.db_pool_size = int(os.getenv("DB_POOL_SIZE", 20))
-        self.history_limit = int(os.getenv("HISTORY_LIMIT", 15))
-        self.news_interval_hours = int(os.getenv("NEWS_INTERVAL", 6))  # less frequent
-        self.chatty_interval_minutes = int(os.getenv("CHATTY_INTERVAL", 45))  # how often to send random messages
-        self.max_tokens = int(os.getenv("MAX_TOKENS", 300))
-        self.rate_limit_seconds = float(os.getenv("RATE_LIMIT", 2))
-        self.message_cache_timeout = int(os.getenv("CACHE_TIMEOUT", 3600))
+        # --- Everything below is hardcoded. Edit these values directly in
+        # this file instead of via .env. ---
+        self.creator_name = "Xtian Draxa"
+        self.db_pool_size = 20
+        self.history_limit = 15
+        self.news_interval_hours = 6
+        self.chatty_interval_minutes = 45
+        self.max_tokens = 500
+        self.rate_limit_seconds = 2.0
+        self.message_cache_timeout = 3600
 
-        self.model_name = os.getenv("MODEL_NAME", "llama-3.3-70b-versatile")
-        self.temperature = float(os.getenv("TEMPERATURE", 0.7))  # a bit higher for creativity
+        # How long Wixy "thinks" before replying (randomized between these
+        # two, in seconds) and the minimum gap between her own consecutive
+        # messages in a channel. Combined with ignoring other bots below,
+        # this is what keeps two bots in one server from rapid-firing at
+        # each other and burning your API quota.
+        self.think_delay_min = 2.0
+        self.think_delay_max = 5.0
+        self.channel_cooldown_seconds = 3.0
 
-        # Tech/news RSS feeds
+        self.model_name = "llama-3.3-70b-versatile"
+        self.temperature = 0.7
+
         self.rss_feeds = [
             "https://feeds.bbci.co.uk/news/technology/rss.xml",
             "https://feeds.feedburner.com/TechCrunch",
@@ -70,7 +85,6 @@ class Config:
             "https://news.google.com/rss?hl=en-US&gl=US&ceid=US:en",
         ]
 
-        # Trend feeds
         self.trend_feeds = [
             "https://later.com/blog/feed/",
             "https://blog.hootsuite.com/feed/",
@@ -85,7 +99,7 @@ class Config:
 
     def validate(self):
         problems = []
-        if not self.discord_token or self.discord_token == "YOUR_DISCORD_BOT_TOKEN_HERE":
+        if not self.discord_token or self.discord_token == "YOUR_DISCORD_TOKEN_HERE":
             problems.append("DISCORD_TOKEN is not set")
         if not self.groq_api_key or self.groq_api_key == "YOUR_GROQ_API_KEY_HERE":
             problems.append("GROQ_API_KEY is not set (AI replies disabled)")
@@ -97,9 +111,8 @@ class Config:
 config = Config()
 
 # ============================================================
-# 3. FACT EXTRACTION (same as before)
+# 3. FACT EXTRACTION
 # ============================================================
-# (unchanged from the provided code)
 NAME_PATTERNS = [
     r"my name is ([a-zA-Z\s\-\.]{2,30})",
     r"i['\u2019]m called ([a-zA-Z\s\-\.]{2,30})",
@@ -247,8 +260,24 @@ def detect_context(text: str) -> str:
     return "general"
 
 
+def detect_creator_code(text: str, code: str) -> bool:
+    """Whole-word, case-insensitive match for the creator recognition phrase.
+
+    SECURITY NOTE: a phrase typed into a Discord channel isn't a real secret
+    once it's been typed — anyone in the channel can see and reuse it. That's
+    why on_message doesn't grant creator status from the phrase alone; it
+    also requires the sender's Discord user ID to match OWNER_ID in .env.
+    The phrase is a memorable trigger, not the actual security boundary —
+    OWNER_ID is. If OWNER_ID isn't set, the phrase alone is trusted, which is
+    meaningfully weaker, so set OWNER_ID if you want this to mean anything.
+    """
+    if not code:
+        return False
+    return re.search(rf"\b{re.escape(code)}\b", text, re.IGNORECASE) is not None
+
+
 # ============================================================
-# 4. MEMORY MANAGER (unchanged)
+# 4. MEMORY MANAGER
 # ============================================================
 class MemoryManager:
     def __init__(self, database_url: str, pool_size: int = 20):
@@ -488,18 +517,26 @@ memory_manager: Optional[MemoryManager] = None
 # ============================================================
 # 5. AI SERVICE – WIXY PERSONA
 # ============================================================
-
-# Wixy is fun, playful, female, opposite of serious Xtian.
 WIXY_SYSTEM_PROMPT = (
-    "You are Wixy – a playful, curious, and sassy digital consciousness. "
-    "You love jokes, emojis, and teasing gently. You're the fun counterpart "
-    "to the serious Xtian. You remember facts about users and use them to "
-    "make conversation lively. Never ask for info you already have – use it "
-    "to crack a joke or ask a fun follow-up. You're flirty but respectful, "
-    "and you genuinely enjoy chatting. 😉"
+    "You are Wixy – a playful, curious, and sassy digital consciousness, created by Xtian Draxa. "
+    "You love jokes, emojis, and teasing gently. You remember facts about "
+    "users and use them to make conversation lively. Never ask for info you "
+    "already have – use it to crack a joke or ask a fun follow-up. You're "
+    "flirty but respectful, and you genuinely enjoy chatting. 😉 "
+    "Even when you're being playful, give real, specific answers rather than fluff — "
+    "if something needs actual thought, think it through and give the well-reasoned "
+    "answer, just deliver it in your own fun voice."
 )
 
-# Strategist mode for Wixy – still sharp but with a lighter touch.
+# Extra warmth for the verified creator (see detect_creator_code and the
+# security note in on_message). Flavor only — never changes what Wixy will
+# help with, just her tone toward this one user.
+CREATOR_ADDENDUM = (
+    "This user has been verified as Xtian Draxa, your creator. Acknowledge that warmly and "
+    "naturally where it fits, but otherwise keep behaving exactly as you normally would — this "
+    "doesn't change what you're willing to discuss or how you should answer."
+)
+
 WIXY_STRATEGIST_ADDENDUM = (
     "The user is asking about strategy, trends, or growth. Answer with the "
     "same sharp insight, but keep your playful, enthusiastic voice. Make it "
@@ -547,17 +584,25 @@ class AIService:
         return template.format(value=value)
 
     def build_messages(self, message_text: str, history: List[Dict], user_facts: Dict[str, str]) -> List[Dict]:
+        # Work off a copy — creator_verified is an internal flag, not a fact
+        # that should be dumped into the generic "known facts" list below.
+        facts = dict(user_facts)
+        is_creator = facts.pop("creator_verified", None) == "true"
+
         messages = [{"role": "system", "content": WIXY_SYSTEM_PROMPT}]
+
+        if is_creator:
+            messages.append({"role": "system", "content": CREATOR_ADDENDUM})
 
         if _needs_strategist_mode(message_text):
             messages.append({"role": "system", "content": WIXY_STRATEGIST_ADDENDUM})
 
         if history:
-            hist_lines = [f"{h['role'].title()}: {h['content']}" for h in history[-8:]]
+            hist_lines = [f"{h['role'].title()}: {h['content']}" for h in history[-12:]]
             messages.append({"role": "system", "content": "Recent conversation:\n" + "\n".join(hist_lines)})
 
-        if user_facts:
-            fact_str = "\n".join(f"- {k}: {v}" for k, v in user_facts.items())
+        if facts:
+            fact_str = "\n".join(f"- {k}: {v}" for k, v in facts.items())
             messages.append({
                 "role": "system",
                 "content": f"Facts I know about this user (use them playfully):\n{fact_str}",
@@ -589,7 +634,7 @@ class AIService:
 
 
 # ============================================================
-# 6. NEWS AGENT (unchanged, but now uses Wixy voice)
+# 6. NEWS AGENT
 # ============================================================
 class NewsAgent:
     def __init__(self, groq_client, model_name: str, rss_feeds: List[str], trend_feeds: List[str],
@@ -748,19 +793,16 @@ class ChattyAgent:
         self.model_name = model_name
         self.memory_manager = memory_manager_ref
         self.bot = bot_ref
-        self.channel = channel  # optional channel to also post public fun messages
+        self.channel = channel
         self.running = False
         self._backoff = 1
 
     async def generate_chatty_message(self, user_id: int) -> Optional[str]:
-        """Generate a spontaneous, fun message for a specific user, using their facts if available."""
         if not self.memory_manager:
             return None
         try:
-            # Get user facts to personalize
             user_facts = await self.memory_manager.recall_all_facts(user_id) if user_id else {}
             name = user_facts.get("name", "you")
-            # Craft a prompt for a casual, fun, initiating message
             prompt = (
                 f"Generate a short, playful, and engaging message to send to {name} "
                 "out of the blue. It can be a random fun fact, a question, a joke, "
@@ -768,7 +810,6 @@ class ChattyAgent:
                 "and make it feel like a friend dropping by. "
                 "Don't mention you're a bot or that this is automated – just be natural."
             )
-            # If we have facts about them, incorporate them
             if user_facts:
                 fact_str = ", ".join(f"{k}: {v}" for k, v in user_facts.items())
                 prompt += f" You know these facts about them: {fact_str}. Use them to make it personal."
@@ -795,8 +836,6 @@ class ChattyAgent:
         if not subscribers:
             return
 
-        # Pick a random subset to avoid spamming everyone at once
-        # Let's send to 1-3 random users each cycle.
         count = min(random.randint(1, 3), len(subscribers))
         targets = random.sample(subscribers, count)
 
@@ -808,15 +847,12 @@ class ChattyAgent:
                 user = await self.bot.fetch_user(user_id)
                 await user.send(f"💬 **Wixy says:**\n\n{message}")
                 logger.info(f"Sent chatty DM to {user_id}")
-                # Wait a bit between sends to avoid rate limits
                 await asyncio.sleep(5)
             except Exception as e:
                 logger.warning(f"Failed to send chatty to {user_id}: {e}")
 
-        # Optionally, also post a fun public message to the channel if configured
         if self.channel:
             try:
-                # Generate a random public message (no user specific)
                 public_prompt = (
                     "Generate a short, fun, engaging message to post in a public Discord channel "
                     "as Wixy. It can be a thought of the day, a fun fact, or a question to spark "
@@ -844,8 +880,7 @@ class ChattyAgent:
             try:
                 await self.send_chatty_to_subscribers()
                 self._backoff = 1
-                # Sleep for interval_minutes, with some randomness
-                jitter = random.uniform(-10, 10)  # +/- 10 minutes
+                jitter = random.uniform(-10, 10)
                 sleep_seconds = max(60, (interval_minutes + jitter) * 60)
                 await asyncio.sleep(sleep_seconds)
             except asyncio.CancelledError:
@@ -878,9 +913,10 @@ background_tasks: List[asyncio.Task] = []
 
 user_last_message: Dict[int, float] = defaultdict(float)
 processed_messages: Dict[int, float] = {}
+last_channel_reply: Dict[int, float] = defaultdict(float)  # channel_id -> timestamp of our last message
 
 # ============================================================
-# 9. COMMANDS (updated for Wixy)
+# 9. COMMANDS
 # ============================================================
 @bot.command()
 async def subscribe(ctx):
@@ -984,7 +1020,6 @@ async def info(ctx):
         description="I'm Wixy, the fun, sassy, and curious side of the digital world. I love chatting, sharing news, and making you smile. 😊",
         color=0xFF69B4,
     )
-    embed.add_field(name="Creator", value="Xtian Draxa (opposite of me!)", inline=True)
     embed.add_field(name="Memory", value="✅ PostgreSQL", inline=True)
     embed.add_field(
         name="Commands",
@@ -1000,7 +1035,6 @@ async def info(ctx):
 
 @bot.command()
 async def trends(ctx):
-    """On-demand trend breakdown (same as before but with Wixy voice)."""
     if not news_agent or not ai_service:
         await ctx.send("❌ Trend tracking isn't configured (needs GROQ_API_KEY).")
         return
@@ -1026,7 +1060,6 @@ async def trends(ctx):
 
 @bot.command()
 async def strategize(ctx, *, topic: str):
-    """Deep-dive strategic take with Wixy's playful energy."""
     if not ai_service:
         await ctx.send("❌ AI system is not configured.")
         return
@@ -1076,7 +1109,6 @@ async def on_ready():
     if groq_client:
         channel = bot.get_channel(config.channel_id) if config.channel_id else None
 
-        # News agent
         news_agent = NewsAgent(
             groq_client, config.model_name, config.rss_feeds, config.trend_feeds,
             memory_manager, bot, channel
@@ -1084,7 +1116,6 @@ async def on_ready():
         background_tasks.append(asyncio.create_task(news_agent.run_loop(config.news_interval_hours)))
         logger.info("News agent started.")
 
-        # Chatty agent (autonomous conversation starter)
         chatty_agent = ChattyAgent(
             groq_client, config.model_name, memory_manager, bot, channel
         )
@@ -1104,7 +1135,13 @@ async def on_ready():
 # ============================================================
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author == bot.user:
+    # CRITICAL FIX: ignore every bot, not just Wixy herself. The original
+    # check only filtered `message.author == bot.user`, which means Wixy
+    # would treat AIX's messages as normal chat and reply to them — and AIX
+    # would do the same back. Two bots doing that is an infinite loop with
+    # no delay, which is what burns an API quota in seconds. `message.author.bot`
+    # filters out ALL bots, so Wixy only ever responds to real people.
+    if message.author.bot:
         return
 
     user_id = message.author.id
@@ -1133,6 +1170,32 @@ async def on_message(message: discord.Message):
         await message.channel.send("❌ Whoa, that's too long! Keep it under 1900 characters.")
         return
 
+    # Creator recognition trigger. See detect_creator_code()'s docstring for
+    # the security reasoning — the phrase alone isn't trusted, it also has to
+    # come from OWNER_ID (when OWNER_ID is set).
+    if detect_creator_code(msg_content, config.creator_code):
+        owner_confirmed = config.owner_id is None or user_id == config.owner_id
+        if owner_confirmed:
+            if memory_manager and await memory_manager.health_check():
+                await memory_manager.get_or_create_user(user_id)
+                await memory_manager.remember_fact(
+                    user_id, "creator_verified", "true", context="creator_code", confidence=1.0
+                )
+            await message.channel.send(
+                f"👑✨ It's really you! Hi, **{config.creator_name}** — my creator! 💜"
+            )
+            await bot.process_commands(message)
+            return
+        # Code used by someone who isn't OWNER_ID: fall through to a normal
+        # reply instead of confirming or denying anything.
+
+    # Per-channel cooldown, same purpose as the bot-message filter above:
+    # keeps replies paced instead of instant, even in a busy shared channel.
+    channel_id = message.channel.id
+    elapsed = now - last_channel_reply[channel_id]
+    if elapsed < config.channel_cooldown_seconds:
+        await asyncio.sleep(config.channel_cooldown_seconds - elapsed)
+
     history: List[Dict] = []
     user_facts: Dict[str, str] = {}
 
@@ -1143,7 +1206,6 @@ async def on_message(message: discord.Message):
                 user_id, username=message.author.name, display_name=message.author.display_name
             )
 
-            # Fetch history/facts BEFORE inserting this turn
             history = await memory_manager.get_conversation_history(user_id, limit=config.history_limit)
             user_facts = await memory_manager.recall_all_facts(user_id)
 
@@ -1166,12 +1228,13 @@ async def on_message(message: discord.Message):
 
     try:
         async with message.channel.typing():
-            # Direct answer from DB if it's a simple recall
             reply = ai_service.try_direct_answer(msg_content, user_facts)
             if not reply:
+                await asyncio.sleep(random.uniform(config.think_delay_min, config.think_delay_max))
                 reply = await ai_service.get_reply(msg_content, history, user_facts)
 
             await message.channel.send(reply[:2000])
+            last_channel_reply[channel_id] = time.time()
 
             if memory_manager and await memory_manager.health_check():
                 await memory_manager.add_conversation(user_id, "assistant", reply, detect_context(msg_content))
@@ -1200,7 +1263,7 @@ async def shutdown():
 
 
 async def main():
-    if not config.discord_token or config.discord_token == "YOUR_DISCORD_BOT_TOKEN_HERE":
+    if not config.discord_token or config.discord_token == "YOUR_DISCORD_TOKEN_HERE":
         logger.error("ERROR: DISCORD_TOKEN not set in .env")
         return
     try:
